@@ -71,10 +71,6 @@ local bridge_queue_head = 1
 local bridge_queue_tail = 0
 local bridge_queue_limit = 128
 local bridge_request_timeout = 110 -- C++ WinHTTP can spend up to ~90s on a request.
-local bridge_trace_sequence = 0
-local function bridge_trace(req, message)
-    warn("[bridge-trace:" .. tostring(req and req.trace_id or "?") .. "] " .. tostring(message))
-end
 
 local function bridge_queue_push(req)
     if bridge_queue_tail - bridge_queue_head + 1 >= bridge_queue_limit then
@@ -132,23 +128,14 @@ end
 if not raw_HttpService then raw_HttpService = HttpService end
 
 local function finish_bridge_request(req, ok, result)
-    if req.finished then
-        bridge_trace(req, "finish ignored: already finished")
-        return
-    end
+    if req.finished then return end
     req.finished = true
-    bridge_trace(req, "finish ENTER ok=" .. tostring(ok)
-        .. " waiter_present=" .. tostring(req.waiter ~= nil)
-        .. " result_type=" .. typeof(result))
 
     if req.waiter then
         local waiter = req.waiter
         task.defer(function()
             if coroutine.status(waiter) == "suspended" then
-                bridge_trace(req, "deferred resume attempt waiter_status=" .. coroutine.status(waiter))
                 local resumed, resume_error = coroutine.resume(waiter, ok, result)
-                bridge_trace(req, "deferred resume returned resumed=" .. tostring(resumed)
-                    .. " error=" .. tostring(resume_error))
                 if not resumed then
                     enqueue_console("error", "bridge resume failed: " .. tostring(resume_error))
                 end
@@ -158,7 +145,6 @@ local function finish_bridge_request(req, ok, result)
         req.ok = ok
         req.result = result
         req.done = true
-        bridge_trace(req, "completion stored for polling caller")
     end
 end
 
@@ -224,10 +210,8 @@ task.spawn(function()
 end)
 
 local function send_bridge_request(name, url, payload)
-    bridge_trace_sequence += 1
     local waiter, is_main = coroutine.running()
     local req = {
-        trace_id = bridge_trace_sequence,
         name = name,
         url = url,
         payload = payload,
@@ -235,13 +219,9 @@ local function send_bridge_request(name, url, payload)
         deadline = os.clock() + bridge_request_timeout,
     }
 
-    bridge_trace(req, "send ENTER payload_bytes=" .. #payload
-        .. " waiter=" .. tostring(waiter ~= nil) .. " is_main=" .. tostring(is_main))
     if not bridge_queue_push(req) then
-        bridge_trace(req, "queue push FAILED: queue full")
         error(name .. ": bridge queue is full", 2)
     end
-    bridge_trace(req, "queued; waiter registration has not happened yet")
 
     if not waiter or is_main then
         while not req.done and os.clock() < req.deadline do
@@ -249,18 +229,14 @@ local function send_bridge_request(name, url, payload)
         end
         if not req.done then
             req.cancelled = true
-            bridge_trace(req, "polling caller timed out")
             error(name .. ": request timed out", 2)
         end
-        bridge_trace(req, "polling caller observed done ok=" .. tostring(req.ok))
         if not req.ok then error(req.result, 2) end
         return req.result
     end
 
     req.waiter = waiter
-    bridge_trace(req, "waiter registered; about to yield")
     local ok, result = coroutine.yield()
-    bridge_trace(req, "waiter resumed ok=" .. tostring(ok) .. " result_type=" .. typeof(result))
     if not ok then error(result, 2) end
     return result
 end
@@ -841,19 +817,16 @@ function Bluberii.loadstring(source, chunkname)
     local id = HttpService:GenerateGUID(false)
     local pending = Bluberii.load_pending
     pending[id] = false
-    warn("[loadstring-trace:" .. id .. "] pending=false created source_bytes=" .. #source)
     local function hex(value)
         return (value:gsub(".", function(byte) return string.format("%02x", string.byte(byte)) end))
     end
 
     local ok, result_body = pcall(send_bridge_request, "loadstring", "http://127.0.0.1:6969/load/" .. Bluberii_http_token .. "/" .. id .. "/" .. hex(chunkname), source)
     if not ok then
-        warn("[loadstring-trace:" .. id .. "] bridge request FAILED: " .. tostring(result_body))
         pending[id] = nil
         return nil, tostring(result_body)
     end
 
-    warn("[loadstring-trace:" .. id .. "] bridge HTTP response received; checking pending")
     local result = pending[id]
     if result == false then
         -- The C-side is expected to populate pending[id] during the bridge request.
@@ -864,7 +837,6 @@ function Bluberii.loadstring(source, chunkname)
             result = pending[id]
         end
     end
-    warn("[loadstring-trace:" .. id .. "] pending wait finished result_type=" .. typeof(result))
     pending[id] = nil
 
     if result == false or result == nil then
@@ -875,7 +847,6 @@ function Bluberii.loadstring(source, chunkname)
     if result.error then return nil, result.error end
 
     return function(...)
-        warn("[loadstring-trace:" .. id .. "] returned function ENTER")
         if type(synchronize) == "function" then synchronize() end
         local env = getfenv(2)
         if type(env) == "table" then
@@ -883,18 +854,7 @@ function Bluberii.loadstring(source, chunkname)
             if env.__Bluberii_http_index == nil then rawset(env, "__Bluberii_http_index", script_env.__Bluberii_http_index) end
         end
         setfenv(result.fn, env)
-        local __args = table.pack(...)
-        local __results = table.pack(xpcall(function()
-            return result.fn(table.unpack(__args, 1, __args.n))
-        end, function(__err)
-            return debug and debug.traceback and debug.traceback(tostring(__err), 2) or tostring(__err)
-        end))
-        if not __results[1] then
-            warn("[loadstring-trace:" .. id .. "] returned function ERROR: " .. tostring(__results[2]))
-            error(__results[2], 0)
-        end
-        warn("[loadstring-trace:" .. id .. "] returned function RETURN values=" .. tostring(__results.n - 1))
-        return table.unpack(__results, 2, __results.n)
+        return result.fn(...)
     end
 end
 
