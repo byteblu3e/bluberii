@@ -64,7 +64,53 @@ local user_id = (Players and Players.LocalPlayer and Players.LocalPlayer.UserId)
 
 local function field(value) return tostring(#value) .. "\n" .. value end
 
+-- Bridge requests are deliberately serialized.  Keep the queue bounded and
+-- use monotonic deadlines so a timed-out caller cannot leave stale work behind.
 local bridge_queue = {}
+local bridge_queue_head = 1
+local bridge_queue_tail = 0
+local bridge_queue_limit = 128
+local bridge_request_timeout = 110 -- C++ WinHTTP can spend up to ~90s on a request.
+
+local function bridge_queue_push(req)
+    if bridge_queue_tail - bridge_queue_head + 1 >= bridge_queue_limit then
+        return false
+    end
+    bridge_queue_tail += 1
+    bridge_queue[bridge_queue_tail] = req
+    return true
+end
+
+local function bridge_queue_pop()
+    if bridge_queue_head > bridge_queue_tail then
+        bridge_queue = {}
+        bridge_queue_head = 1
+        bridge_queue_tail = 0
+        return nil
+    end
+
+    local req = bridge_queue[bridge_queue_head]
+    bridge_queue[bridge_queue_head] = nil
+    bridge_queue_head += 1
+
+    -- Avoid a permanently growing sparse array after long sessions.
+    if bridge_queue_head > 128 and bridge_queue_head > bridge_queue_tail / 2 then
+        local compact = {}
+        local count = 0
+        for i = bridge_queue_head, bridge_queue_tail do
+            local item = bridge_queue[i]
+            if item then
+                count += 1
+                compact[count] = item
+            end
+        end
+        bridge_queue = compact
+        bridge_queue_head = 1
+        bridge_queue_tail = count
+    end
+
+    return req
+end
 
 local raw_HttpService = nil
 local raw_request_internal = nil
@@ -81,70 +127,115 @@ end
 
 if not raw_HttpService then raw_HttpService = HttpService end
 
+local function finish_bridge_request(req, ok, result)
+    if req.finished then return end
+    req.finished = true
+
+    if req.waiter then
+        local waiter = req.waiter
+        task.defer(function()
+            if coroutine.status(waiter) == "suspended" then
+                local resumed, resume_error = coroutine.resume(waiter, ok, result)
+                if not resumed then
+                    enqueue_console("error", "bridge resume failed: " .. tostring(resume_error))
+                end
+            end
+        end)
+    else
+        req.ok = ok
+        req.result = result
+        req.done = true
+    end
+end
+
 task.spawn(function()
     while true do
-        local req = table.remove(bridge_queue, 1)
-        if req then
-            local ok, result = pcall(function()
-                local handle
-                if raw_request_internal then
-                    handle = raw_request_internal(raw_HttpService, {
-                        Url = req.url,
-                        Method = "POST",
-                        Body = req.payload,
-                    })
-                else
-                    handle = HttpService:RequestInternal({
-                        Url = req.url,
-                        Method = "POST",
-                        Body = req.payload,
-                    })
-                end
+        local req = bridge_queue_pop()
+        if not req then
+            task.wait(0.01)
+            continue
+        end
 
-                local done, success, response = false, false, nil
-                handle:Start(function(ok2, res) success = ok2; response = res; done = true end)
-                local deadline = os.time() + 15
-                while not done and os.time() < deadline do task.wait() end
-                if not done then error(req.name .. ": request timed out") end
-                if type(response) ~= "table" or type(response.Body) ~= "string" then
-                    error(req.name .. ": invalid bridge response")
-                end
-                if not success or response.StatusCode ~= 200 then
-                    error(response.Body ~= "" and response.Body or req.name .. ": bridge failed")
-                end
-                return response.Body
+        -- A caller may have timed out while this request was waiting in queue.
+        if req.cancelled or os.clock() >= req.deadline then
+            finish_bridge_request(req, false, req.name .. ": request expired in queue")
+            continue
+        end
+
+        local ok, result = pcall(function()
+            local handle
+            if raw_request_internal then
+                handle = raw_request_internal(raw_HttpService, {
+                    Url = req.url,
+                    Method = "POST",
+                    Body = req.payload,
+                })
+            else
+                handle = HttpService:RequestInternal({
+                    Url = req.url,
+                    Method = "POST",
+                    Body = req.payload,
+                })
+            end
+
+            if not handle or type(handle.Start) ~= "function" then
+                error(req.name .. ": RequestInternal returned an invalid handle")
+            end
+
+            local done, success, response = false, false, nil
+            handle:Start(function(ok2, res)
+                if done then return end
+                success = ok2
+                response = res
+                done = true
             end)
 
-            if req.waiter then
-                task.defer(function()
-                    if coroutine.status(req.waiter) == "suspended" then
-                        coroutine.resume(req.waiter, ok, result)
-                    end
-                end)
-            else
-                req.ok = ok
-                req.result = result
-                req.done = true
+            while not done and os.clock() < req.deadline do
+                task.wait(0.02)
             end
-        else
-            task.wait(0.01)
-        end
+            if not done then
+                error(req.name .. ": bridge request timed out")
+            end
+            if type(response) ~= "table" or type(response.Body) ~= "string" then
+                error(req.name .. ": invalid bridge response")
+            end
+            if not success or response.StatusCode ~= 200 then
+                error(response.Body ~= "" and response.Body or req.name .. ": bridge failed")
+            end
+            return response.Body
+        end)
+
+        finish_bridge_request(req, ok, result)
     end
 end)
 
 local function send_bridge_request(name, url, payload)
     local waiter, is_main = coroutine.running()
+    local req = {
+        name = name,
+        url = url,
+        payload = payload,
+        done = false,
+        deadline = os.clock() + bridge_request_timeout,
+    }
+
+    if not bridge_queue_push(req) then
+        error(name .. ": bridge queue is full", 2)
+    end
+
     if not waiter or is_main then
-        local req = { name = name, url = url, payload = payload, done = false }
-        table.insert(bridge_queue, req)
-        local deadline = os.time() + 15
-        while not req.done and os.time() < deadline do task.wait() end
-        if not req.done then error(name .. ": request timed out", 2) end
+        while not req.done and os.clock() < req.deadline do
+            task.wait(0.02)
+        end
+        if not req.done then
+            req.cancelled = true
+            error(name .. ": request timed out", 2)
+        end
         if not req.ok then error(req.result, 2) end
         return req.result
     end
-    local req = { name = name, url = url, payload = payload, waiter = waiter }
-    table.insert(bridge_queue, req)
+
+    req.waiter = waiter
     local ok, result = coroutine.yield()
     if not ok then error(result, 2) end
     return result
